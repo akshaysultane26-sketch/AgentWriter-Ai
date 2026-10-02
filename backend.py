@@ -3,6 +3,7 @@ from __future__ import annotations
 import operator
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -148,11 +149,60 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM (Groq, free hosted)
 # -----------------------------
-llm = ChatGroq(
-    model=os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-    temperature=0,
-    max_retries=6,
-)
+# Free-tier Groq limits are counted per model and per minute, so we:
+#  - keep a backup model (its limits are counted separately),
+#  - allow only a few LLM calls at the same time,
+#  - wait and retry when a rate limit (429) happens.
+PRIMARY_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+BACKUP_MODEL = os.getenv("GROQ_MODEL_BACKUP", "openai/gpt-oss-20b")
+
+
+def _make_llm(model_name: str):
+    return ChatGroq(model=model_name, temperature=0, max_retries=0)
+
+
+LLMS = [_make_llm(PRIMARY_MODEL)]
+if BACKUP_MODEL and BACKUP_MODEL != PRIMARY_MODEL:
+    LLMS.append(_make_llm(BACKUP_MODEL))
+
+_LLM_GATE = threading.Semaphore(int(os.getenv("LLM_CONCURRENCY", "2")))
+
+
+def _is_rate_limit(error: Exception) -> bool:
+    text = str(error).lower()
+    return (
+        "rate_limit_exceeded" in text
+        or "rate limit" in text
+        or "error code: 429" in text
+    )
+
+
+def _retry_after_seconds(error: Exception) -> float:
+    match = re.search(r"try again in (?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", str(error))
+    if not match:
+        return 10.0
+    minutes = float(match.group(1) or 0)
+    seconds = float(match.group(2) or 0)
+    return minutes * 60 + seconds + 1.0
+
+
+def call_llm(messages, schema=None):
+    """Call Groq with model fallback and wait-and-retry on rate limits."""
+    last_error = None
+    with _LLM_GATE:
+        for _ in range(8):
+            for model_llm in LLMS:
+                try:
+                    runnable = model_llm.with_structured_output(schema) if schema else model_llm
+                    return runnable.invoke(messages)
+                except Exception as e:
+                    if not _is_rate_limit(e):
+                        raise
+                    last_error = e
+            wait = min(_retry_after_seconds(last_error), 30.0)
+            print(f"Rate limited on all models, waiting {wait:.0f}s")
+            time.sleep(wait)
+    raise last_error
 
 
 # -----------------------------
@@ -179,12 +229,12 @@ If needs_research=true:
 
 def router_node(state: State) -> dict:
     topic = state["topic"]
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
+    decision = call_llm(
         [
             SystemMessage(content=ROUTER_SYSTEM),
             HumanMessage(content=f"Topic: {topic}"),
-        ]
+        ],
+        RouterDecision,
     )
 
     return {
@@ -251,12 +301,12 @@ def research_node(state: State) -> dict:
     if not raw_results:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
+    pack = call_llm(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
             HumanMessage(content=f"Raw results:\n{raw_results}"),
-        ]
+        ],
+        EvidencePack,
     )
 
     # Deduplicate by URL
@@ -308,12 +358,10 @@ Output must strictly match the Plan schema.
 
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
-
     evidence = state.get("evidence", [])
     mode = state.get("mode", "closed_book")
 
-    plan = planner.invoke(
+    plan = call_llm(
         [
             SystemMessage(content=ORCH_SYSTEM),
             HumanMessage(
@@ -321,10 +369,11 @@ def orchestrator_node(state: State) -> dict:
                     f"Topic: {state['topic']}\n"
                     f"Mode: {mode}\n\n"
                     f"Evidence (ONLY use for fresh claims; may be empty):\n"
-                    f"{[e.model_dump() for e in evidence][:16]}"
+                    f"{[e.model_dump() for e in evidence][:10]}"
                 )
             ),
-        ]
+        ],
+        Plan,
     )
 
     return {"plan": plan}
@@ -397,10 +446,10 @@ def worker_node(payload: dict) -> dict:
     if evidence:
         evidence_text = "\n".join(
             f"- {e.title} | {e.url} | {e.published_at or 'date:unknown'}".strip()
-            for e in evidence[:20]
+            for e in evidence[:8]
         )
 
-    section_md = llm.invoke(
+    section_md = call_llm(
         [
             SystemMessage(content=WORKER_SYSTEM),
             HumanMessage(
@@ -494,8 +543,7 @@ def decide_images(state: State) -> dict:
     section_list = "\n".join(f"- {h.strip()}" for h in headings)
 
     try:
-        planner = llm.with_structured_output(ImagePlanLite)
-        result = planner.invoke(
+        result = call_llm(
             [
                 SystemMessage(content=DECIDE_IMAGES_SYSTEM),
                 HumanMessage(
@@ -506,7 +554,8 @@ def decide_images(state: State) -> dict:
                         f"Section titles:\n{section_list}"
                     )
                 ),
-            ]
+            ],
+            ImagePlanLite,
         )
     except Exception as e:
         # never let image planning break the whole blog
